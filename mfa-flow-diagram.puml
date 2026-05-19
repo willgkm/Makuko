@@ -1,0 +1,249 @@
+@startuml MFA Login Flow - AgenciaVirtual & FE-CanaisDigitais
+
+!theme plain
+skinparam backgroundColor #FAFAFA
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 8
+skinparam sequenceParticipantBorderColor #555555
+skinparam sequenceParticipantBackgroundColor #E8F4FD
+skinparam sequenceGroupBorderColor #999999
+skinparam noteBorderColor #CCAA00
+skinparam noteBackgroundColor #FFFACD
+
+title Fluxo de Login MFA\nAgenciaVirtual (Backend) + FE-CanaisDigitais (Frontend)
+
+actor "Cliente" as USER
+
+box "FE-CanaisDigitais (Angular)" #E8F5E9
+    participant "LoginComponent" as LOGIN_COMP
+    participant "LoginService" as LOGIN_SVC
+    participant "LoginMfaFlowService" as MFA_FLOW_SVC
+    participant "SmsService" as SMS_SVC
+    participant "AcnAuthenticationService" as AUTH_SVC
+    participant "SmsTokenGuard\n/ LoginMfaVerificationGuard\n/ LoginPasswordExpiredGuard" as GUARDS
+end box
+
+box "ms-bff / Proxy" #FFF3E0
+    participant "BFF Proxy" as BFF
+end box
+
+box "AgenciaVirtual (Java EE / JAX-RS)" #FCE4EC
+    participant "LoginResourceV4\nPOST /v4/auth/login" as AV_LOGIN
+    participant "LoginServiceV4" as AV_LOGIN_SVC
+    participant "LoginMfaResourceV4\nPOST /v4/auth/mfa/**" as AV_MFA
+    participant "LoginMfaServiceV4" as AV_MFA_SVC
+    participant "TokenServiceV4" as AV_TOKEN_SVC
+    participant "JWTService" as AV_JWT
+    participant "ParametroSistemaService" as AV_PARAM
+    participant "ClienteService" as AV_CLIENTE
+end box
+
+database "BD\n(AV_CODIGO_VERIFICACAO\nAV_CLIENTE)" as DB
+queue "SMS / Email\nGateway" as GATEWAY
+
+' ─────────────────────────────────────────────
+' ETAPA 1 — Login inicial
+' ─────────────────────────────────────────────
+group Etapa 1 — Login Inicial
+
+USER -> LOGIN_COMP : informa login + senha
+LOGIN_COMP -> LOGIN_SVC : onLogin(login, password)
+LOGIN_SVC -> AUTH_SVC : authService.login(login, password)
+AUTH_SVC -> BFF : POST /api/login (email/cpfCnpj + senha)
+BFF -> AV_LOGIN : POST /v4/auth/login
+AV_LOGIN -> AV_LOGIN_SVC : requestLogin(loginRequest)
+AV_LOGIN_SVC -> AV_JWT : generateTokens(userLoginDto, AuthFlow.MFA)
+
+note right of AV_JWT
+  Claims geradas:
+  • clienteId
+  • cpfCnpj / email
+  • authFlow = "mfa"
+  • mfaTokenIsValid = true/false
+  • passwordExpired = true/false
+end note
+
+AV_JWT --> AV_LOGIN_SVC : accessToken + refreshToken
+AV_LOGIN_SVC --> AV_LOGIN : UserLoggedResponse
+AV_LOGIN --> BFF : 200 { accessToken, refreshToken, tokenType, expiresIn }
+BFF --> AUTH_SVC : 200 tokens
+AUTH_SVC --> LOGIN_SVC : tokens salvos em sessão
+
+LOGIN_SVC -> MFA_FLOW_SVC : navigateAfterLogin()\n→ resolveAuthenticatedRoute()
+MFA_FLOW_SVC -> AUTH_SVC : getAccessToken() → decodifica claims
+
+alt mfaTokenIsValid == false → MFA pendente
+    MFA_FLOW_SVC --> LOGIN_SVC : rota = "login/verificacao-metodo"
+    LOGIN_SVC -> GUARDS : SmsTokenGuard / LoginMfaVerificationGuard verifica claims
+    LOGIN_COMP -> USER : exibe seleção de canal MFA (SMS ou E-mail)
+
+else mfaTokenIsValid == true && passwordExpired == true → Senha expirada
+    MFA_FLOW_SVC --> LOGIN_SVC : rota = "login/senha-expirada"
+    LOGIN_COMP -> USER : redireciona para troca obrigatória de senha
+
+else mfaTokenIsValid == true && passwordExpired == false → Autenticado
+    MFA_FLOW_SVC --> LOGIN_SVC : rota = "home-logado"
+    LOGIN_COMP -> USER : acesso à área autenticada final
+end
+
+end group
+
+' ─────────────────────────────────────────────
+' ETAPA 2 — Envio do OTP
+' ─────────────────────────────────────────────
+group Etapa 2 — Envio do Código OTP (MFA pendente)
+
+USER -> LOGIN_COMP : seleciona canal (sms | email)
+LOGIN_COMP -> SMS_SVC : sendLoginMfa(clienteId, mfaType)
+SMS_SVC -> BFF : POST /api/proxy/agencia-virtual/v4/auth/mfa\n/cliente/{idCliente}/send/{tipoEnvio}\nAuthorization: Bearer <token-pré-MFA>
+BFF -> AV_MFA : POST /v4/auth/mfa/cliente/{idCliente}/send/{tipoEnvio}\n[@TokenAuthenticated]
+AV_MFA -> AV_JWT : validateClienteIdFromJwtToken(idCliente)
+
+note right of AV_MFA
+  @TokenAuthenticated:
+  Aceita token mesmo com
+  mfaTokenIsValid=false.
+  Rejeita refresh tokens.
+end note
+
+AV_MFA -> MFA_FLOW_SVC as AV_MFA_SVC : buscarClienteClientId(idCliente)
+AV_MFA_SVC -> AV_CLIENTE : findClienteDados(idCliente)
+AV_CLIENTE --> AV_MFA_SVC : ClienteDadosResponse
+
+alt tipoEnvio == SMS
+    AV_MFA -> AV_MFA_SVC : buscarCelularCliente(cliente)
+    AV_MFA_SVC --> AV_MFA : celular
+    AV_MFA -> AV_TOKEN_SVC : enviarCodigoVerificacaoSms(idCliente, celular)
+else tipoEnvio == EMAIL
+    AV_MFA -> AV_MFA_SVC : buscarEmailCliente(cliente)
+    AV_MFA_SVC --> AV_MFA : email
+    AV_MFA -> AV_TOKEN_SVC : enviarCodigoVerificacaoEmail(idCliente, email)
+end
+
+AV_TOKEN_SVC -> DB : INSERT AV_CODIGO_VERIFICACAO\n(código OTP, TTL 5 min, bloqueio reenvio 150s)
+AV_TOKEN_SVC -> GATEWAY : envia código OTP (5 dígitos)
+AV_TOKEN_SVC --> AV_MFA : VerificacaoSmsResponse / VerificacaoEmailResponse\n{ message, expiresAt }
+AV_MFA --> BFF : 201 Created
+BFF --> SMS_SVC : 201 { message, expiresAt }
+SMS_SVC -> MFA_FLOW_SVC : setInitialSendCompleted(clienteId, mfaType)\n→ salva contexto em sessionStorage
+LOGIN_COMP -> USER : exibe tela OTP\n(timer 150s para reenvio)
+GATEWAY --> USER : recebe código OTP por SMS/e-mail
+
+end group
+
+' ─────────────────────────────────────────────
+' ETAPA 3 — Validação do OTP
+' ─────────────────────────────────────────────
+group Etapa 3 — Validação do Código OTP
+
+USER -> LOGIN_COMP : informa código OTP (5 dígitos)
+LOGIN_COMP -> SMS_SVC : validateLoginMfa(clienteId, token, mfaType)
+SMS_SVC -> BFF : POST /api/proxy/agencia-virtual/v4/auth/mfa\n/cliente/{idCliente}/validate/{tipoEnvio}\nBody: { token: "XXXXX" }
+BFF -> AV_MFA : POST /v4/auth/mfa/cliente/{idCliente}/validate/{tipoEnvio}\n[@TokenAuthenticated]
+AV_MFA -> AV_JWT : validateClienteIdFromJwtToken(idCliente)
+AV_MFA -> AV_TOKEN_SVC : confirmarCodigoSms/Email(destino, tokenSanitizado)
+AV_TOKEN_SVC -> DB : SELECT + validação do código\n(verifica expiração e validade)
+
+alt Código inválido
+    DB --> AV_TOKEN_SVC : VERIFICATION_CODE_INVALID
+    AV_TOKEN_SVC --> AV_MFA : ConfirmacaoResponse(validado=false, reason=INVALID)
+    AV_MFA --> BFF : 400 { reason: VERIFICATION_CODE_INVALID }
+    BFF --> SMS_SVC : 400
+    LOGIN_COMP -> USER : exibe erro "código inválido"
+
+else Código expirado
+    DB --> AV_TOKEN_SVC : VERIFICATION_CODE_EXPIRED
+    AV_TOKEN_SVC --> AV_MFA : ConfirmacaoResponse(validado=false, reason=EXPIRED)
+    AV_MFA --> BFF : 400 { reason: VERIFICATION_CODE_EXPIRED }
+    BFF --> SMS_SVC : 400
+    LOGIN_COMP -> USER : exibe erro "código expirado"
+
+else Código válido
+    DB --> AV_TOKEN_SVC : OK
+    AV_TOKEN_SVC --> AV_MFA : ConfirmacaoResponse(validado=true)
+    AV_MFA -> AV_MFA_SVC : requestLogin(clienteId, loginRequest)
+    AV_MFA_SVC -> AV_PARAM : isSenhaExpirada(cliente.getDataAlteracaoSenha())
+    AV_PARAM --> AV_MFA_SVC : senhaExpirada (true/false)
+
+    alt Senha NÃO expirada
+        AV_MFA_SVC -> AV_CLIENTE : registerMfaValidado(clienteId)\n(registra MFA_VALIDADO no banco)
+    end
+
+    AV_MFA_SVC -> AV_JWT : generateTokens(UserLoginDto(\n  mfaTokenIsValid=true,\n  passwordExpired=senhaExpirada\n), AuthFlow.MFA)
+    AV_JWT --> AV_MFA_SVC : novo accessToken + refreshToken
+    AV_MFA_SVC --> AV_MFA : UserLoggedResponse
+    AV_MFA --> BFF : 200 { accessToken, refreshToken }
+    BFF --> SMS_SVC : 200 tokens
+    SMS_SVC -> LOGIN_SVC : completeAuthenticatedSession(accessToken, refreshToken)
+    LOGIN_SVC -> AUTH_SVC : doLoginUser(accessToken, refreshToken)
+    LOGIN_SVC -> MFA_FLOW_SVC : navigateAfterLogin() → resolveAuthenticatedRoute()
+
+    alt passwordExpired == true
+        MFA_FLOW_SVC --> LOGIN_SVC : rota = "login/senha-expirada"
+        LOGIN_COMP -> USER : redireciona para troca obrigatória de senha
+    else passwordExpired == false
+        MFA_FLOW_SVC -> MFA_FLOW_SVC : clear() → remove contexto do sessionStorage
+        MFA_FLOW_SVC --> LOGIN_SVC : rota = "home-logado"
+        LOGIN_COMP -> USER : acesso à área autenticada final
+    end
+end
+
+end group
+
+' ─────────────────────────────────────────────
+' ETAPA 4 — Redefinição de senha expirada
+' ─────────────────────────────────────────────
+group Etapa 4 — Redefinição de Senha Expirada (opcional)
+
+note over GUARDS
+  LoginPasswordExpiredGuard:
+  Verifica canAccessPasswordExpiredRoute()
+  → mfaTokenIsValid=true && passwordExpired=true
+end note
+
+USER -> LOGIN_COMP : informa nova senha + confirmação
+LOGIN_COMP -> LOGIN_SVC : updateExpiredPassword(newPassword, confirmPassword)
+LOGIN_SVC -> BFF : POST /api/proxy/agencia-virtual/v4/auth/redefinir-senha-expirada\nAuthorization: Bearer <token-pós-MFA-senha-expirada>\nBody: { newPassword, confirmPassword }
+BFF -> AV_LOGIN : POST /v4/auth/redefinir-senha-expirada\n[@PasswordExpiredAuthenticated]
+
+note right of AV_LOGIN
+  @PasswordExpiredAuthenticated:
+  Exige mfaTokenIsValid=true
+  E passwordExpired=true
+end note
+
+AV_LOGIN -> AV_LOGIN_SVC : resetPasswordExpired(request)
+AV_LOGIN_SVC -> AV_LOGIN_SVC : validateConfirmPassword(new, confirm)
+AV_LOGIN_SVC -> AV_LOGIN_SVC : validateStrongPassword(novaSenha)
+
+alt Senha fraca (policy violation)
+    AV_LOGIN_SVC --> AV_LOGIN : 400 PASSWORD_POLICY_VIOLATION
+    AV_LOGIN --> BFF : 400
+    BFF --> LOGIN_SVC : 400
+    LOGIN_COMP -> USER : exibe erro de política de senha
+
+else Senha igual à anterior
+    AV_LOGIN_SVC --> AV_LOGIN : 400 PASSWORD_SAME_AS_PREVIOUS
+    AV_LOGIN --> BFF : 400
+    BFF --> LOGIN_SVC : 400
+    LOGIN_COMP -> USER : exibe erro "senha igual à anterior"
+
+else Senha válida
+    AV_LOGIN_SVC -> AV_CLIENTE : updateClientePassword(clienteId, novaSenha)
+    AV_CLIENTE -> DB : UPDATE senha do cliente
+    AV_LOGIN_SVC -> AV_CLIENTE : registerMfaValidado(clienteId)
+    AV_CLIENTE -> DB : UPDATE MFA_VALIDADO
+    AV_LOGIN_SVC -> AV_LOGIN_SVC : reloadUsuarioAgenciaVirtual(clienteId)
+    AV_LOGIN_SVC -> AV_JWT : generateTokens(userLoginDto, AuthFlow.MFA)\n(token final: mfaTokenIsValid=true, passwordExpired=false)
+    AV_JWT --> AV_LOGIN_SVC : accessToken + refreshToken (token final)
+    AV_LOGIN_SVC --> AV_LOGIN : UserLoggedResponse
+    AV_LOGIN --> BFF : 200 { accessToken, refreshToken }
+    BFF --> LOGIN_SVC : 200 tokens
+    LOGIN_SVC -> AUTH_SVC : doLoginUser(accessToken, refreshToken)
+    MFA_FLOW_SVC -> MFA_FLOW_SVC : clear()
+    LOGIN_COMP -> USER : acesso à área autenticada final
+end
+
+end group
+
+@enduml
